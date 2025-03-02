@@ -1,105 +1,87 @@
-# models/progression.py
+import torch
+import torch.nn as nn
 import numpy as np
-from datetime import datetime, timedelta
+import cv2
+from scipy.stats import norm
+from utils.image_processing import preprocess_image, enhance_contrast, detect_edges
+from database.db import save_patient_data, log_progression_history
+from datetime import datetime
+import logging
 
-# Define key brain regions with (x, y, z) coordinates for 3D model
-BRAIN_REGIONS = {
-    'hippocampus': {'left': {'coords': [35, 45, 30], 'size': 5}, 'right': {'coords': [65, 45, 30], 'size': 5}},
-    'entorhinal_cortex': {'left': {'coords': [32, 50, 25], 'size': 3}, 'right': {'coords': [68, 50, 25], 'size': 3}},
-    'prefrontal_cortex': {'left': {'coords': [35, 65, 40], 'size': 8}, 'right': {'coords': [65, 65, 40], 'size': 8}}
-}
+# Configure Logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-def calculate_progression_scenarios(factors, affected_regions):
+# Define LSTM Model with Dropout and Batch Normalization for better generalization
+class LSTMModel(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size):
+        super(LSTMModel, self).__init__()
+        self.lstm = nn.LSTM(input_size, hidden_size, batch_first=True, dropout=0.3)
+        self.batch_norm = nn.BatchNorm1d(hidden_size)
+        self.fc = nn.Linear(hidden_size, output_size)
+
+    def forward(self, x):
+        lstm_out, _ = self.lstm(x)
+        lstm_out = self.batch_norm(lstm_out[:, -1, :])
+        return self.fc(lstm_out)
+
+# Load pre-trained LSTM model
+model = LSTMModel(input_size=350, hidden_size=128, output_size=1)  # Increased input size for extra features
+model.load_state_dict(torch.load("models/progression_model.pth", map_location=torch.device("cpu")))
+model.eval()
+
+def predict_disease_progression(patient_data, image_path, lab_report=None, previous_records=None):
     """
-    Calculate two progression scenarios based on patient factors
-    
-    Args:
-        factors (dict): Dict with age, genetic_markers, etc.
-        affected_regions (dict): Currently affected regions from scan
-        
-    Returns:
-        tuple: (scenario_a, scenario_b) where each scenario contains progression timeline
+    Predicts disease progression using LSTM and Bayesian probability.
+    :param patient_data: List of numerical health metrics (heart rate, BP, cholesterol, etc.).
+    :param image_path: Path to the MRI/CT image file.
+    :param lab_report: Optional list of lab test results.
+    :param previous_records: Optional list of past progression scores.
+    :return: Predicted risk score & confidence level.
     """
-    # Extract factors
-    age = factors['age']
-    genetic_risk = factors['genetic_markers']
-    brain_metrics = factors['brain_metrics']
-    biomarkers = factors['biomarkers']
-    cognitive = factors['cognitive_scores']
     
-    # Generate timepoints (years)
-    timepoints = list(range(0, 16, 1))  # 0 to 15 years
-    dates = [(datetime.now() + timedelta(days=365*t)).strftime('%Y-%m') for t in timepoints]
-    
-    # Calculate risk score (0-1)
-    base_risk = (0.3 * genetic_risk + 0.2 * biomarkers + 0.1 * (age/100) + 
-                0.2 * (1 - brain_metrics/100) + 0.2 * (1 - cognitive/100))
-    
-    # Scenario A: Typical progression
-    scenario_a = {
-        'name': 'Typical Progression',
-        'description': 'Most likely progression based on current factors',
-        'timepoints': dates,
-        'regions': {}
-    }
-    
-    # Scenario B: Accelerated/Variant progression
-    scenario_b = {
-        'name': 'Accelerated Progression',
-        'description': 'More aggressive progression scenario',
-        'timepoints': dates,
-        'regions': {}
-    }
-    
-    # Calculate degeneration for each region over time
-    for region, location in BRAIN_REGIONS.items():
-        # Different rates for the two scenarios
-        base_rate_a = base_risk * 0.07  # 7% annual decline at maximum risk
-        base_rate_b = base_risk * 0.12  # 12% annual decline in accelerated scenario
-        
-        # Region-specific modifiers
-        if region == 'hippocampus':
-            modifier_a, modifier_b = 1.2, 1.5
-        elif region == 'entorhinal_cortex':
-            modifier_a, modifier_b = 1.0, 1.3
-        else:  # prefrontal_cortex
-            modifier_a, modifier_b = 0.8, 1.1
-        
-        # Calculate progression
-        progression_a = []
-        progression_b = []
-        
-        # Start with current state (from scan analysis)
-        current_value = 1.0
-        if region in affected_regions:
-            current_value = max(0.4, 1.0 - affected_regions[region] * 0.6)
-        
-        value_a = current_value
-        value_b = current_value
-        
-        for _ in timepoints:
-            progression_a.append(round(value_a, 2))
-            progression_b.append(round(value_b, 2))
-            
-            # Apply decline rates
-            value_a = max(0.1, value_a - (base_rate_a * modifier_a))
-            value_b = max(0.1, value_b - (base_rate_b * modifier_b))
-        
-        scenario_a['regions'][region] = progression_a
-        scenario_b['regions'][region] = progression_b
-    
-    # Calculate overall cognitive function
-    region_weights = {'hippocampus': 0.4, 'entorhinal_cortex': 0.3, 'prefrontal_cortex': 0.3}
-    
-    scenario_a['cognitive_function'] = []
-    scenario_b['cognitive_function'] = []
-    
-    for t_idx in range(len(timepoints)):
-        # Weighted average of region values
-        cog_a = sum(scenario_a['regions'][r][t_idx] * region_weights[r] for r in BRAIN_REGIONS)
-        cog_b = sum(scenario_b['regions'][r][t_idx] * region_weights[r] for r in BRAIN_REGIONS)
-        
-        scenario_a['cognitive_function'].append(round(cog_a, 2))
-        scenario_b['cognitive_function'].append(round(cog_b, 2))
-    
-    return scenario_a, scenario_b
+    try:
+        logging.info("Processing MRI/CT image for feature extraction...")
+        image_features = preprocess_image(image_path)
+
+        logging.info("Enhancing image contrast and detecting critical features...")
+        enhanced_image = enhance_contrast(image_path)
+        edge_features = detect_edges(image_path)
+
+        # Normalize additional data
+        lab_report = np.array(lab_report) if lab_report else np.zeros(10)  # 10 lab features (default 0)
+        previous_records = np.array(previous_records) if previous_records else np.zeros(5)  # Last 5 records
+
+        # Combine all inputs
+        combined_input = np.concatenate((patient_data, image_features, edge_features, lab_report, previous_records), axis=0)
+        input_tensor = torch.tensor(combined_input, dtype=torch.float32).unsqueeze(0)
+
+        logging.info("Running LSTM model for disease progression prediction...")
+        risk_score = model(input_tensor).item()
+
+        # Advanced Bayesian probability estimation
+        confidence = dynamic_bayesian_probability(risk_score, previous_records)
+
+        # Save patient data to database
+        save_patient_data(patient_data, image_features, edge_features, risk_score, confidence, lab_report)
+
+        # Log progression history
+        log_progression_history(patient_data, risk_score, confidence)
+
+        logging.info(f"Prediction Complete - Risk Score: {risk_score:.4f}, Confidence: {confidence:.2%}")
+        return {"risk_score": risk_score, "confidence": confidence, "timestamp": datetime.now().isoformat()}
+
+    except Exception as e:
+        logging.error(f"Error in disease progression prediction: {e}")
+        return {"error": str(e)}
+
+def dynamic_bayesian_probability(risk_score, history):
+    """
+    Custom Bayesian probability estimation considering historical trends.
+    :param risk_score: Current risk score.
+    :param history: Past disease progression records.
+    :return: Adjusted confidence estimation.
+    """
+    baseline = np.mean(history) if len(history) > 0 else 0.5
+    deviation = np.std(history) if len(history) > 0 else 0.1
+    return norm.cdf(risk_score, loc=baseline, scale=deviation)
+
